@@ -1,0 +1,499 @@
+from rest_framework import generics, status, permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from django.shortcuts import get_object_or_404
+from django.db import transaction
+from django.core.exceptions import PermissionDenied
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.db.models import Sum
+
+from django.db import models
+from .models import User, Train, Booking, Station
+from .serializers import (
+    SignupSerializer,
+    LoginSerializer,
+    TrainSerializer,
+    TrainAvailabilitySerializer,
+    BookingSerializer,
+    BookingCreateSerializer,
+    BookingDetailSerializer,
+)
+from .authenticate import AdminAPIKeyAuthentication
+from django.conf import settings
+
+# Signup view
+class SignupView(APIView):
+    def post(self, request):
+        serializer = SignupSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            return Response({
+                "status": "Account successfully created",
+                "status_code": 200,
+                "user_id": user.id
+            }, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+# Login view
+class LoginView(APIView):
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.validated_data['user']
+            refresh = RefreshToken.for_user(user)
+            response_data = {
+                "status": "Login successful",
+                "status_code": 200,
+                "user_id": str(user.id),
+                "access_token": str(refresh.access_token),
+                "is_admin": user.is_admin
+            }
+            
+            # Include admin API key if user is admin
+            if user.is_admin:
+                print("Debug - Adding admin API key to response for admin user")
+                response_data["admin_api_key"] = settings.ADMIN_API_KEY
+                print("Debug - Admin API key added:", settings.ADMIN_API_KEY)
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+        return Response({
+            "status": "Incorrect username/password provided. Please retry",
+            "status_code": 401
+        }, status=status.HTTP_401_UNAUTHORIZED)
+
+# Admin API key permission class
+class AdminApiKeyPermission(permissions.BasePermission):
+    def has_permission(self, request, view):
+        auth_header = request.headers.get("Authorization")
+        print("Debug - Auth header:", auth_header)  # Debug print
+        print("Debug - Expected API key:", settings.ADMIN_API_KEY)  # Debug print
+        
+        if not auth_header or not auth_header.startswith("Api-Key "):
+            print("Debug - Auth header missing or wrong format")  # Debug print
+            return False
+            
+        key = auth_header.split(" ")[1]
+        is_valid = key == settings.ADMIN_API_KEY
+        print("Debug - API key valid:", is_valid)  # Debug print
+        return is_valid
+
+# Train creation by admin with API key authentication
+class TrainCreateView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        try:
+            print("Received data:", request.data)  # Debug print
+            
+            # Extract data from request
+            data = request.data
+            name = data.get('train_name')
+            source_name = data.get('source')
+            destination_name = data.get('destination')
+            total_seats = data.get('seat_capacity')
+            departure_time = data.get('arrival_time_at_source')
+            arrival_time = data.get('arrival_time_at_destination')
+
+            # Print received values for debugging
+            print("Extracted values:")
+            print(f"Name: {name}")
+            print(f"Source: {source_name}")
+            print(f"Destination: {destination_name}")
+            print(f"Seats: {total_seats}")
+            print(f"Departure: {departure_time}")
+            print(f"Arrival: {arrival_time}")
+
+            # Validate each field individually and collect errors
+            errors = {}
+            if not name:
+                errors['train_name'] = "Train name is required"
+            if not source_name:
+                errors['source'] = "Source station is required"
+            if not destination_name:
+                errors['destination'] = "Destination station is required"
+            if not total_seats:
+                errors['seat_capacity'] = "Seat capacity is required"
+            elif not str(total_seats).isdigit():
+                errors['seat_capacity'] = "Seat capacity must be a number"
+            if not departure_time:
+                errors['arrival_time_at_source'] = "Departure time is required"
+            if not arrival_time:
+                errors['arrival_time_at_destination'] = "Arrival time is required"
+
+            if errors:
+                return Response({
+                    "error": "Validation failed",
+                    "details": errors
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Convert total_seats to integer
+            try:
+                total_seats = int(total_seats)
+                if total_seats <= 0:
+                    return Response({
+                        "error": "Invalid seat capacity",
+                        "details": {"seat_capacity": "Seat capacity must be greater than 0"}
+                    }, status=status.HTTP_400_BAD_REQUEST)
+            except (ValueError, TypeError):
+                return Response({
+                    "error": "Invalid seat capacity",
+                    "details": {"seat_capacity": "Seat capacity must be a valid number"}
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Validate time format
+            try:
+                from datetime import datetime
+                datetime.strptime(departure_time, '%H:%M:%S')
+                datetime.strptime(arrival_time, '%H:%M:%S')
+            except ValueError:
+                return Response({
+                    "error": "Invalid time format",
+                    "details": "Time must be in HH:MM:SS format"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Check if train name exists
+            if Train.objects.filter(name=name).exists():
+                return Response({
+                    "error": "Train already exists",
+                    "details": {"train_name": f"Train with name {name} already exists"}
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Get or create source station
+            try:
+                source, _ = Station.objects.get_or_create(
+                    station_name=source_name,
+                    defaults={
+                        'station_code': source_name[:5].upper(),
+                        'city': source_name,
+                        'state': 'Unknown'
+                    }
+                )
+            except Exception as e:
+                return Response({
+                    "error": "Failed to create source station",
+                    "details": str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Get or create destination station
+            try:
+                destination, _ = Station.objects.get_or_create(
+                    station_name=destination_name,
+                    defaults={
+                        'station_code': destination_name[:5].upper(),
+                        'city': destination_name,
+                        'state': 'Unknown'
+                    }
+                )
+            except Exception as e:
+                return Response({
+                    "error": "Failed to create destination station",
+                    "details": str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Create the train
+            try:
+                train = Train.objects.create(
+                    name=name,
+                    source=source,
+                    destination=destination,
+                    total_seats=total_seats,
+                    departure_time=departure_time,
+                    arrival_time=arrival_time
+                )
+            except Exception as e:
+                return Response({
+                    "error": "Failed to create train",
+                    "details": str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response({
+                "message": "Train added successfully",
+                "train_id": train.train_id,
+                "status": "success",
+                "train_details": {
+                    "name": train.name,
+                    "source": train.source.station_name,
+                    "destination": train.destination.station_name,
+                    "total_seats": train.total_seats,
+                    "departure_time": train.departure_time,
+                    "arrival_time": train.arrival_time
+                }
+            }, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            print("Error creating train:", str(e))  # Debug print
+            return Response({
+                "error": "Failed to process request",
+                "details": str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+# Train availability
+class TrainAvailabilityView(APIView):
+    def get(self, request):
+        source = request.query_params.get('source')
+        destination = request.query_params.get('destination')
+
+        if not source or not destination:
+            return Response(
+                {"detail": "source and destination query parameters are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Find stations that match the source and destination
+        source_stations = Station.objects.filter(station_name__iexact=source)
+        destination_stations = Station.objects.filter(station_name__iexact=destination)
+
+        if not source_stations.exists():
+            return Response({"detail": f"No station found with name: {source}"}, status=status.HTTP_404_NOT_FOUND)
+        
+        if not destination_stations.exists():
+            return Response({"detail": f"No station found with name: {destination}"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Find trains between these stations
+        trains = Train.objects.filter(source__in=source_stations, destination__in=destination_stations)
+
+        result = []
+        for train in trains:
+            booked_count = Booking.objects.filter(train=train, booked=True).aggregate(total=models.Sum('seat_count'))['total'] or 0
+            available_seats = max(train.total_seats - booked_count, 0)
+            result.append({
+                "train_id": train.train_id,
+                "train_name": train.name,
+                "source": train.source.station_name,
+                "destination": train.destination.station_name,
+                "available_seats": available_seats,
+            })
+
+        return Response(result)
+
+# Book seat view
+class BookSeatView(APIView):
+    def post(self, request, train_id):
+        user_id = request.data.get('user_id')
+        no_of_seats = request.data.get('no_of_seats')
+
+        # Validate input presence
+        if not user_id or not no_of_seats:
+            return Response({"message": "user_id and no_of_seats are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            no_of_seats = int(no_of_seats)
+            if no_of_seats <= 0:
+                raise ValueError()
+        except ValueError:
+            return Response({"message": "no_of_seats must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(pk=user_id)
+        except User.DoesNotExist:
+            return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            train = Train.objects.get(train_id=train_id)
+        except Train.DoesNotExist:
+            return Response({"message": "Train not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        with transaction.atomic():
+            # Lock the train to prevent concurrent seat overbooking
+            train = Train.objects.select_for_update().get(pk=train.pk)
+
+            booked_count = Booking.objects.filter(train=train, booked=True).aggregate(total=Sum('seat_count'))['total'] or 0
+            available_seats = train.total_seats - booked_count
+
+            if no_of_seats > available_seats:
+                return Response({"message": f"Only {available_seats} seats are available."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Collect already booked seat numbers for this train
+            booked_seat_numbers = Booking.objects.filter(train=train, booked=True).values_list('seat_numbers', flat=True)
+            booked_seat_numbers = set(num for sublist in booked_seat_numbers for num in sublist)
+
+            # Assign seats sequentially
+            seat_numbers = []
+            seat_num = 1
+            while len(seat_numbers) < no_of_seats and seat_num <= train.total_seats:
+                if seat_num not in booked_seat_numbers:
+                    seat_numbers.append(seat_num)
+                seat_num += 1
+
+            # Create booking record
+            booking = Booking.objects.create(
+                user=user,
+                train=train,
+                seat_count=no_of_seats,
+                seat_numbers=seat_numbers,
+                booked=True
+            )
+
+        return Response({
+            "message": "Seat booked successfully",
+            "booking_id": str(booking.id),
+            "seat_numbers": seat_numbers
+        }, status=status.HTTP_201_CREATED)
+
+# Booking detail view - only owner or admin can access
+class BookingDetailView(generics.RetrieveAPIView):
+    queryset = Booking.objects.all()
+    serializer_class = BookingDetailSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        booking = super().get_object()
+        if booking.user != self.request.user and not self.request.user.is_admin:
+            raise PermissionDenied("You do not have permission to view this booking.")
+        return booking
+
+# Admin Signup view
+class AdminSignupView(APIView):
+    authentication_classes = [AdminAPIKeyAuthentication]
+    permission_classes = [AdminApiKeyPermission]
+
+    def post(self, request):
+        data = request.data.copy()
+        data['is_admin'] = True  # Force is_admin to be True
+        serializer = SignupSerializer(data=data)
+        if serializer.is_valid():
+            user = serializer.save()
+            # Set additional admin privileges
+            user.is_staff = True
+            user.is_superuser = True
+            user.is_admin = True  # Explicitly set is_admin
+            user.save()
+            return Response({
+                "status": "Admin account successfully created",
+                "status_code": 200,
+                "user_id": user.id,
+                "is_admin": True
+            }, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+# Admin Dashboard Views
+class AdminDashboardView(APIView):
+    authentication_classes = [AdminAPIKeyAuthentication]
+    permission_classes = [AdminApiKeyPermission]
+
+    def get(self, request):
+        # Get counts and summary
+        total_trains = Train.objects.count()
+        total_stations = Station.objects.count()
+        total_bookings = Booking.objects.count()
+        
+        return Response({
+            "total_trains": total_trains,
+            "total_stations": total_stations,
+            "total_bookings": total_bookings,
+        })
+
+class AdminStationListView(APIView):
+    authentication_classes = [AdminAPIKeyAuthentication]
+    permission_classes = [AdminApiKeyPermission]
+
+    def get(self, request):
+        stations = Station.objects.all()
+        return Response([{
+            "id": station.id,
+            "station_code": station.station_code,
+            "station_name": station.station_name,
+            "city": station.city,
+            "state": station.state
+        } for station in stations])
+
+    def post(self, request):
+        station_name = request.data.get('station_name')
+        city = request.data.get('city')
+        state = request.data.get('state')
+        station_code = request.data.get('station_code')
+
+        if not station_name or not city or not state or not station_code:
+            return Response({
+                "error": "Missing required fields",
+                "details": "station_name, city, state, and station_code are required"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            station = Station.objects.create(
+                station_name=station_name,
+                city=city,
+                state=state,
+                station_code=station_code
+            )
+            return Response({
+                "message": "Station created successfully",
+                "station": {
+                    "id": station.id,
+                    "station_code": station.station_code,
+                    "station_name": station.station_name,
+                    "city": station.city,
+                    "state": station.state
+                }
+            }, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({
+                "error": "Failed to create station",
+                "details": str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+class AdminTrainListView(APIView):
+    authentication_classes = [AdminAPIKeyAuthentication]
+    permission_classes = [AdminApiKeyPermission]
+
+    def get(self, request):
+        trains = Train.objects.all()
+        return Response([{
+            "train_id": train.train_id,
+            "name": train.name,
+            "source": train.source.station_name,
+            "destination": train.destination.station_name,
+            "total_seats": train.total_seats,
+            "departure_time": train.departure_time,
+            "arrival_time": train.arrival_time
+        } for train in trains])
+
+    def post(self, request):
+        name = request.data.get('name')
+        source_code = request.data.get('source_code')
+        destination_code = request.data.get('destination_code')
+        total_seats = request.data.get('total_seats')
+        departure_time = request.data.get('departure_time')
+        arrival_time = request.data.get('arrival_time')
+
+        if not all([name, source_code, destination_code, total_seats, departure_time, arrival_time]):
+            return Response({
+                "error": "Missing required fields",
+                "details": "name, source_code, destination_code, total_seats, departure_time, and arrival_time are required"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            source = Station.objects.get(station_code=source_code)
+            destination = Station.objects.get(station_code=destination_code)
+        except Station.DoesNotExist:
+            return Response({
+                "error": "Invalid source or destination station code"
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            train = Train.objects.create(
+                name=name,
+                source=source,
+                destination=destination,
+                total_seats=total_seats,
+                departure_time=departure_time,
+                arrival_time=arrival_time
+            )
+            return Response({
+                "message": "Train created successfully",
+                "train": {
+                    "train_id": train.train_id,
+                    "name": train.name,
+                    "source": train.source.station_name,
+                    "destination": train.destination.station_name,
+                    "total_seats": train.total_seats,
+                    "departure_time": train.departure_time,
+                    "arrival_time": train.arrival_time
+                }
+            }, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({
+                "error": "Failed to create train",
+                "details": str(e)
+            }, status=status.HTTP_400_BAD_REQUEST) 
