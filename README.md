@@ -218,14 +218,8 @@ ADMIN_API_KEY=your_admin_api_key
 - [Django Documentation](https://docs.djangoproject.com)
 - [Django REST Framework Documentation](https://www.django-rest-framework.org)
 
-## 🤝 Contributing
+#As part of the selection process for the internship at StepOut, I was given a project task to complete. I successfully implemented all the required features and went a step further by adding a few extra enhancements. I also modified some components to improve performance and overall functionality.This task was a great learning experience and allowed me to apply my skills in a practical context. It also helped me understand the expectations and development approach of the team.
 
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+Looking Forward:
+I’m truly excited about the possibility of joining StepOut as an intern. I look forward to learning, growing, and contributing meaningfully to the team.A heartfelt thank you to the entire StepOut team for this opportunity and for designing such a thoughtful and engaging task.
 
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details. 
